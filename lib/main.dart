@@ -1,7 +1,68 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 
 void main() {
   runApp(const BankingHubApp());
+}
+
+class OllamaService {
+  static const String baseUrl = 'http://localhost:11434';
+  static const String defaultModel = 'llama3.2';
+
+  static Future<String> generateResponse(String prompt, {String? model}) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/api/generate'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'model': model ?? defaultModel,
+          'prompt': prompt,
+          'stream': false,
+        }),
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        return data['response'] ?? 'No response received';
+      } else {
+        throw Exception('HTTP ${response.statusCode}: ${response.body}');
+      }
+    } catch (e) {
+      throw Exception('Failed to connect to Ollama: $e');
+    }
+  }
+
+  static Future<List<String>> getAvailableModels() async {
+    try {
+      final response = await http.get(
+        Uri.parse('$baseUrl/api/tags'),
+        headers: {'Content-Type': 'application/json'},
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        final models = data['models'] as List<dynamic>? ?? [];
+        return models.map((model) => model['name'] as String).toList();
+      } else {
+        return [defaultModel];
+      }
+    } catch (e) {
+      return [defaultModel];
+    }
+  }
+
+  static Future<bool> isServerAvailable() async {
+    try {
+      final response = await http.get(
+        Uri.parse('$baseUrl/api/version'),
+       // timeout: const Duration(seconds: 5),
+      );
+      return response.statusCode == 200;
+    } catch (e) {
+      return false;
+    }
+  }
 }
 
 class BankingHubApp extends StatelessWidget {
@@ -187,6 +248,7 @@ class _BankingHubScreenState extends State<BankingHubScreen> {
                     ),
                   ),
                 ),
+                const SizedBox(height: 26),
               ],
             ),
           ),
@@ -396,29 +458,73 @@ class FullScreenChatModal extends StatefulWidget {
 class _FullScreenChatModalState extends State<FullScreenChatModal> {
   final TextEditingController _messageController = TextEditingController();
   final List<ChatMessage> _messages = [
-    ChatMessage(text: "Hello! How can I help you today?", isUser: false),
+    ChatMessage(text: "Hello! I'm your banking assistant. How can I help you today?", isUser: false),
   ];
+  bool _isLoading = false;
+  bool _isOllamaConnected = false;
 
-  void _sendMessage() {
+  @override
+  void initState() {
+    super.initState();
+    _checkOllamaConnection();
+  }
+
+  Future<void> _checkOllamaConnection() async {
+    final isConnected = await OllamaService.isServerAvailable();
+    if (mounted) {
+      setState(() {
+        _isOllamaConnected = isConnected;
+      });
+      if (!isConnected) {
+        _messages.add(ChatMessage(
+          text: "⚠️ Ollama server is not available. Please make sure Ollama is running on localhost:11434",
+          isUser: false,
+        ));
+      }
+    }
+  }
+
+  Future<void> _sendMessage() async {
     if (_messageController.text.trim().isEmpty) return;
 
+    final userMessage = _messageController.text.trim();
+    _messageController.clear();
+
     setState(() {
-      _messages.add(ChatMessage(text: _messageController.text, isUser: true));
-      
-      // Simple bot response
-      Future.delayed(const Duration(milliseconds: 500), () {
-        if (mounted) {
-          setState(() {
-            _messages.add(ChatMessage(
-              text: "I'm here to help! This is a demo response.",
-              isUser: false,
-            ));
-          });
-        }
-      });
+      _messages.add(ChatMessage(text: userMessage, isUser: true));
+      _isLoading = true;
     });
 
-    _messageController.clear();
+    try {
+      if (!_isOllamaConnected) {
+        await _checkOllamaConnection();
+        if (!_isOllamaConnected) {
+          throw Exception('Ollama server is not available');
+        }
+      }
+
+      final bankingContext = "You are a helpful banking assistant. Provide concise, professional answers about banking services, account management, transfers, and financial questions. Keep responses under 100 words.";
+      final fullPrompt = "$bankingContext\n\nUser question: $userMessage\n\nResponse:";
+
+      final response = await OllamaService.generateResponse(fullPrompt);
+
+      if (mounted) {
+        setState(() {
+          _messages.add(ChatMessage(text: response, isUser: false));
+          _isLoading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _messages.add(ChatMessage(
+            text: "Sorry, I'm having trouble connecting to the AI service. Error: ${e.toString()}",
+            isUser: false,
+          ));
+          _isLoading = false;
+        });
+      }
+    }
   }
 
   @override
@@ -443,7 +549,20 @@ class _FullScreenChatModalState extends State<FullScreenChatModal> {
           AppBar(
             backgroundColor: Colors.transparent,
             elevation: 0,
-            title: const Text('Chat Assistant'),
+            title: Row(
+              children: [
+                const Text('Banking Assistant'),
+                const SizedBox(width: 8),
+                Container(
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    color: _isOllamaConnected ? Colors.green : Colors.red,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              ],
+            ),
             leading: IconButton(
               icon: const Icon(Icons.close),
               onPressed: () => Navigator.pop(context),
@@ -452,8 +571,11 @@ class _FullScreenChatModalState extends State<FullScreenChatModal> {
           Expanded(
             child: ListView.builder(
               padding: const EdgeInsets.all(16),
-              itemCount: _messages.length,
+              itemCount: _messages.length + (_isLoading ? 1 : 0),
               itemBuilder: (context, index) {
+                if (index == _messages.length && _isLoading) {
+                  return const LoadingBubble();
+                }
                 final message = _messages[index];
                 return ChatBubble(message: message);
               },
@@ -488,10 +610,16 @@ class _FullScreenChatModalState extends State<FullScreenChatModal> {
                   ),
                   const SizedBox(width: 8),
                   IconButton(
-                    onPressed: _sendMessage,
-                    icon: const Icon(Icons.send),
+                    onPressed: _isLoading ? null : _sendMessage,
+                    icon: _isLoading 
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.send),
                     style: IconButton.styleFrom(
-                      backgroundColor: Colors.blue,
+                      backgroundColor: _isLoading ? Colors.grey : Colors.blue,
                       foregroundColor: Colors.white,
                     ),
                   ),
@@ -569,6 +697,61 @@ class ChatBubble extends StatelessWidget {
               child: const Icon(Icons.person, size: 16),
             ),
           ],
+        ],
+      ),
+    );
+  }
+}
+
+class LoadingBubble extends StatelessWidget {
+  const LoadingBubble({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.start,
+        children: [
+          CircleAvatar(
+            radius: 16,
+            backgroundColor: Colors.grey[300],
+            child: const Icon(Icons.support_agent, size: 16),
+          ),
+          const SizedBox(width: 8),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.grey[100],
+              borderRadius: const BorderRadius.only(
+                topLeft: Radius.circular(16),
+                topRight: Radius.circular(16),
+                bottomRight: Radius.circular(16),
+                bottomLeft: Radius.circular(4),
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    valueColor: AlwaysStoppedAnimation<Color>(Colors.grey[600]!),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  'Thinking...',
+                  style: TextStyle(
+                    color: Colors.grey[600],
+                    fontSize: 14,
+                  ),
+                ),
+              ],
+            ),
+          ),
         ],
       ),
     );
